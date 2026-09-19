@@ -55,7 +55,7 @@ Document the troubleshooting process and what you discovered.
 If the exact cause could not be confirmed:
 
 > **Root cause:** Undetermined
-> **Most likely cause:** [Explain your assessment.]
+> **Most likely cause:** [Explain your Assessment.]
 
 ---
 
