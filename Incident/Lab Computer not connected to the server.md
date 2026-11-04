@@ -59,6 +59,10 @@ If the exact cause could not be confirmed:
 
 Describe how you confirmed that the issue was successfully resolved.
 
+
+
+
+
 * [Re insertion of ethernet] — **PASS**
 
 **Final Status:** Resolved

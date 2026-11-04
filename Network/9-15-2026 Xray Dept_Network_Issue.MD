@@ -1,4 +1,4 @@
-# # [Incident Title]
+# # [Xray Dept Network Issue]
 
 **Date:** 2026-09-15
 **Category:** Network
@@ -9,20 +9,9 @@
 ## Problem Summary
 
 [Briefly describe the reported problem or issue encountered.]
-NETWORK CANT ACCESS THE BIZBOX'S SYSTEM UPON CONNECTING TO 172.16.2.1 (IP ADDRESS OF SERVER)
----
+-------------------------------------------------------------
 
-## Symptoms
-
-* [Observed symptom or error]
-* [Observed symptom or error]
-* [Observed symptom or error]
-
-**Error Message (if applicable):**
-
-`[Error message]`
-
----
+NETWORK CANT ACCESS THE BIZBOX'S SYSTEM UPON CONNECTING TO 172.16.2.1 (IP ADDRESS OF SERVER)---
 
 ## Investigation
 
@@ -44,19 +33,14 @@ IT DOES NOT RESOLVE IT
 USING NET USE //172.16.2.1 /USER:Administrator
 After putting the password, it can now access the server's IP along with the shared folder the server
 
-
 ---
 
 ## Root Cause
-
 
 > **Root cause:** Undetermined
 > **Most likely cause:** Unknown
 
 ---
-
-
-
 
 **Final Status:** Resolved
 
