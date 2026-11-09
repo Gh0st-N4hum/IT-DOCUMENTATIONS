@@ -1,0 +1,22 @@
+From the script’s own instructions, open Command Prompt (or PowerShell) and go to the scans folder:
+
+cd C:\Scans
+
+Then run one of these:
+
+Command	What it does
+python scan_sorter.py --dry-run	Test only. Shows what it would do and moves or creates nothing. Run this first.
+python scan_sorter.py --once	Sorts everything in C:\Scans\Inbox, then stops.
+python scan_sorter.py	Keeps watching the Inbox and sorts new PDFs as they arrive. Press Ctrl+C to stop.
+python scan_sorter.py --debug	Also writes a debug_<filename>.txt in C:\Scans. Use it with --dry-run when something sorts wrong.
+
+Before running:
+
+Put the batch PDF in C:\Scans\Inbox.
+Make sure the script file is named scan_sorter.py and sits in C:\Scans, since that’s where you ran it from before.
+
+Sorted files go to C:\Scans\Sorted, anything unsure goes to C:\Scans\Review, and the original batch PDF moves to C:\Scans\Processed. There is also a log in C:\Scans\sorter_log.txt.
+
+If you get a “module not found” error, install the libraries once with:
+
+pip install pytesseract pdf2image pillow pypdf
