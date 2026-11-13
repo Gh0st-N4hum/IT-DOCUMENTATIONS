@@ -1279,7 +1279,7 @@ $('#fsMk').addEventListener('click', async () => {
 /* ---------- settings tab ---------- */
 const SET_LABELS = {inbox: 'Inbox (scans arrive here)', sorted: 'Sorted', review: 'Review', processed: 'Processed (original batches)',
   log_file: 'Log file', manifest_dir: 'Batch records', report_file: 'Completeness report file', cache_dir: 'Temporary OCR cache',
-  workers: 'Pages read at the same time (1-16)', keep_debug_days: 'Keep debug files (days)', keep_cache_days: 'Keep OCR cache (days)', log_max_mb: 'Archive the log above (MB)'};
+  workers: 'Pages read at the same time (1-16)', keep_debug_days: 'Keep debug files (days)', keep_cache_days: 'Keep OCR cache (days)', use_position: 'Name a document from its patient\'s other papers when its own name is unreadable (1 = yes, 0 = no)', log_max_mb: 'Archive the log above (MB)'};
 async function loadSettings() {
   try {
     const d = await api('settings'); $('#setFile').textContent = d.file;

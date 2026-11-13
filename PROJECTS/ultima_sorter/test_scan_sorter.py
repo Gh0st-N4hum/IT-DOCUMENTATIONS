@@ -205,6 +205,73 @@ class SameSurnameTests(unittest.TestCase):
         self.assertEqual(ss.first_name_of("SOA", "Patient Name: LLANES, MARITES R. x"), "MARITES")
 
 
+def seg(doc, name=None, date=None, readings=None, pages=(0,)):
+    return {"doc": doc, "name": name, "date": date, "readings": readings or [], "pages": list(pages)}
+
+
+class GroupTests(unittest.TestCase):
+    def patient(self, name, date="10-19-2026", hda=None, readings=None, lab=True):
+        out = [seg("CF2", name, None), seg("SOA", name, date), seg("CSF", name, None), seg("HDA", hda, date, readings)]
+        return out + ([seg("LAB", None, None)] if lab else [])
+
+    def test_groups_follow_the_order(self):
+        segs = self.patient("ARCE") + self.patient("ALTURA")
+        self.assertEqual(ss.group_segments(segs), 2)
+        self.assertEqual([s["group"] for s in segs], [0] * 5 + [1] * 5)
+
+    def test_unreadable_hda_and_lab_take_the_patients_name(self):
+        segs = self.patient("ARCE") + self.patient("ALTURA")
+        ss.resolve_group_identities(segs)
+        self.assertEqual([s["name"] for s in segs], ["ARCE"] * 5 + ["ALTURA"] * 5)
+        self.assertTrue(all(s["date"] == "10-19-2026" for s in segs))
+
+    def test_ocr_slip_takes_the_group_spelling(self):
+        segs = [seg("CF2", "ALTURA"), seg("SOA", "ALTURA", "10-19-2026"), seg("CSF", "ALTUBA"), seg("HDA")]
+        ss.resolve_group_identities(segs)
+        self.assertEqual([s["name"] for s in segs], ["ALTURA"] * 4)
+
+    def test_signature_that_contradicts_is_not_trusted(self):
+        segs = self.patient("PEDRONAN", readings=["SIPIN", "SIPIN", "PEDRO"]) + self.patient("SIPIN")
+        ss.resolve_group_identities(segs)
+        hda = segs[3]
+        self.assertEqual((hda["name"], hda.get("conflict")), ("SIPIN", "PEDRONAN"))
+
+    def test_garbled_signature_does_not_block(self):
+        segs = self.patient("PEDRONAN", readings=["NTHE", "XQZV", "ARBEVO"]) + self.patient("SIPIN")
+        ss.resolve_group_identities(segs)
+        self.assertEqual(segs[3]["name"], "PEDRONAN")
+
+    def test_hda_with_a_different_name_goes_to_review(self):
+        segs = self.patient("PEDRONAN", hda="SIPIN") + self.patient("SIPIN")
+        ss.resolve_group_identities(segs)
+        self.assertEqual(segs[3].get("conflict"), "PEDRONAN")
+
+    def test_hdas_in_a_row_are_not_guessed(self):
+        segs = [seg("CF2", "ARCE"), seg("SOA", "ARCE"), seg("CSF", "ARCE"), seg("HDA"), seg("HDA"), seg("HDA")]
+        ss.resolve_group_identities(segs)
+        self.assertIsNone(segs[3]["name"])
+
+    def test_two_different_names_in_a_group_is_not_guessed(self):
+        segs = [seg("CF2", "ARCE"), seg("SOA", "MENDOZA"), seg("HDA")]
+        ss.resolve_group_identities(segs)
+        self.assertIsNone(segs[2]["name"])
+
+    def test_switch_off(self):
+        old = ss.USE_POSITION
+        ss.USE_POSITION = 0
+        try:
+            segs = self.patient("ARCE")
+            ss.resolve_group_identities(segs)
+            self.assertIsNone(segs[3]["name"])
+        finally:
+            ss.USE_POSITION = old
+
+    def test_choose_tolerates_ocr_slips(self):
+        self.assertEqual(ss.choose(["LLANES", "LLANE5", "LANES"]), "LLANES")
+        self.assertIsNone(ss.choose(["ARCE", "MENDOZA"]))
+        self.assertEqual(ss.choose(["RRUEJO", "ARRUEJO"]), "ARRUEJO")
+
+
 class SettingsAndHousekeeping(Base):
     def test_apply_and_save(self):
         self.assertEqual(ss.apply_settings({"workers": "4", "log_max_mb": 5}), [])
@@ -261,6 +328,39 @@ class ProcessFlow(Base):
         self.assertIn("batch_start", kinds)
         self.assertEqual(kinds[-1], "batch_end")
         self.assertTrue(src.exists())               # a dry run never moves the original
+
+    def patient_pages(self, last, first, day="10/19/2026"):
+        return [f"CLAIM FORM 2 patient confinement information\n1. Name of Patient: {last} {first} X\n{day} {day}",
+                f"STATEMENT OF ACCOUNT itemized charges\nPatient Name: {last}, {first} X Date and Time Admitted: {day} {day}",
+                f"CLAIM SIGNATURE FORM member and patient information\nName of Patient:\n{last}",
+                "PHILHEALTH HEMODIALYSIS BENEFITS PACKAGE AGREEMENT FORM annex a",
+                f"CLINICAL LABORATORY REPORT hematology\nName: {last}, {first} X Room: OPD Date: {day}"]
+
+    def test_unreadable_hda_is_named_from_its_patient(self):
+        texts = self.patient_pages("LLANES", "MARITE") + self.patient_pages("ALTURA", "JUAN")
+        real = ss.name_hda_readings
+        ss.name_hda_readings = lambda path, pages: ["NTHE", "XQ"]          # the signature could not be read
+        try:
+            ok, events, src = self.run_batch(texts)
+        finally:
+            ss.name_hda_readings = real
+        self.assertTrue(ok)
+        for who in ("LLANES", "ALTURA"):
+            got = sorted(f.name for f in (ss.SORTED / "10-19-2026" / who).glob("*.pdf"))
+            self.assertEqual(got, ["CF2.pdf", "CSF.pdf", "HDA.pdf", "LAB.pdf", "SOA.pdf"], who)
+        self.assertEqual(list(ss.REVIEW.glob("*.pdf")), [])
+
+    def test_hda_signed_by_someone_else_goes_to_review(self):
+        texts = self.patient_pages("LLANES", "MARITE") + self.patient_pages("ALTURA", "JUAN")
+        real = ss.name_hda_readings
+        ss.name_hda_readings = lambda path, pages: ["ALTURA", "ALTURA"] if pages[0] < 8 else ["ALTURA", "ALTURA"]
+        try:
+            ok, events, src = self.run_batch(texts)
+        finally:
+            ss.name_hda_readings = real
+        self.assertTrue(ok)
+        self.assertEqual(len(list(ss.REVIEW.glob("*HDA*.pdf"))), 1)       # LLANES' HDA read as ALTURA twice
+        self.assertTrue((ss.SORTED / "10-19-2026" / "ALTURA" / "HDA.pdf").exists())
 
     def test_cancel_leaves_original_in_inbox(self):
         def hook(kind, data):

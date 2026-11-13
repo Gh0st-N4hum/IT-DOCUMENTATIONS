@@ -71,6 +71,7 @@ KEEP_DEBUG_DAYS = 7                         # debug_*.txt files and the cache ar
 KEEP_CACHE_DAYS = 7
 LOG_MAX_MB = 2                              # the log is archived (sorter_log.1.txt) above this size
 OCR_DPI = 300
+USE_POSITION = 1                            # 1 = use the order of the papers (CF2, SOA, CSF, HDA, LAB) to name a document whose own name cannot be read
 SETTINGS_FILE = Path(__file__).resolve().with_name("settings.json")   # optional, overrides the above
 
 WORKERS = max(1, min(8, os.cpu_count() or 1))   # pages read at the same time
@@ -170,7 +171,7 @@ SETTING_KEYS = {   # settings.json key -> (variable in this file, kind)
     "manifest_dir": ("MANIFEST_DIR", "path"), "report_file": ("REPORT_FILE", "path"),
     "cache_dir": ("CACHE_DIR", "path"),
     "workers": ("WORKERS", (1, 16)), "keep_debug_days": ("KEEP_DEBUG_DAYS", (0, 3650)),
-    "keep_cache_days": ("KEEP_CACHE_DAYS", (0, 3650)), "log_max_mb": ("LOG_MAX_MB", (1, 1000)),
+    "keep_cache_days": ("KEEP_CACHE_DAYS", (0, 3650)), "use_position": ("USE_POSITION", (0, 1)), "log_max_mb": ("LOG_MAX_MB", (1, 1000)),
 }
 
 
@@ -537,9 +538,39 @@ def name_hda_readings(path, pages):
                 if last:
                     readings.append(last)
                     break
+        if readings and not _strong(readings):      # still unsure: read the same spot again at 400 DPI
+            more = _hda_hires(path, i, cap)
+            readings += more
         if readings:
             return readings
     return readings
+
+
+def _strong(readings):
+    """True when the same spelling was read at least twice (then another pass adds nothing)."""
+    return any(c >= 2 and len(r) >= 4 for r, c in Counter(readings).items())
+
+
+def _hda_hires(path, i, cap):
+    """The name band re-read at 400 DPI (the position comes from the 300 DPI page, scaled)."""
+    out = []
+    try:
+        img = render(path, i, dpi=400)
+        f = 400 / OCR_DPI
+        x0, x1, y1 = (int(v * f) for v in cap)
+        gray = ImageOps.autocontrast(img.convert("L"))
+        band = int(100 * f)
+        for crop in (gray.crop((x0, y1 - band, x1, y1)), prep(img, 110).crop((x0, y1 - band, x1, y1)),
+                     prep(img, 140).crop((x0, y1 - band, x1, y1))):
+            lines = [l for l in pytesseract.image_to_string(crop, config="--psm 7").splitlines()
+                     if re.search(r"[A-Z]{3,}", l) and "conforme" not in l.lower()]
+            if lines:
+                last = last_from_tokens(lines[-1].split())
+                if last:
+                    out.append(last)
+    except Exception:
+        pass
+    return out
 
 
 def snap_to_batch(readings, batch_names, min_ratio=0.75, margin=0.1, min_votes=2):
@@ -570,9 +601,14 @@ def name_hda(path, pages, batch_names):
     readings = name_hda_readings(path, pages)
     hit = snap_to_batch(readings, batch_names) if batch_names else None
     if hit:
-        return hit, readings
+        return hit, readings, None
     agreed = [n for n, c in Counter(readings).most_common() if c >= 2]   # 2+ reads must agree
-    return (agreed[0] if len(agreed) == 1 else None), readings
+    if len(agreed) == 1:
+        return agreed[0], readings, None
+    good = [r for r in readings if len(r) >= 4]
+    if good:       # slips of one name are NOT enough to name a folder (it could be misspelled);
+        return None, readings, best_spelling(cluster_names(good)[0])   # but it is pre-filled in Review
+    return None, readings, None
 
 
 def name_from_known(text, known):
@@ -581,30 +617,52 @@ def name_from_known(text, known):
     return hits[0] if len(hits) == 1 else None
 
 
+def similar(a, b):
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def cluster_names(names, min_ratio=0.8):
+    """Group readings of the same name that differ by an OCR slip ('LLANES'/'LLANE5'/'LANES').
+    Biggest group first. A name that is part of a longer one ('RRUEJO' in 'ARRUEJO') joins it."""
+    clusters = []
+    for n in names:
+        for c in clusters:
+            if any(n == m or similar(n, m) >= min_ratio or (len(n) >= 4 and (n in m or m in n)) for m in c):
+                c.append(n)
+                break
+        else:
+            clusters.append([n])
+    return sorted(clusters, key=len, reverse=True)
+
+
+def best_spelling(cluster):
+    """The spelling most readings agree on; on a tie the one most like all the others (then the longest: OCR drops letters far more often than it adds them)."""
+    counts = Counter(cluster)
+    return max(counts, key=lambda n: (counts[n], sum(similar(n, o) for o in cluster), len(n)))
+
+
 def choose(cands):
     """Majority vote between the different ways of reading the name. OCR often DROPS
     letters ('RRUEJO'), so a shorter result inside a longer one votes for the longer one.
     A tie means 'not sure' -> None."""
     cands = [c for c in cands if c]
-    votes = Counter()
-    for c in cands:
-        longer = [o for o in cands if o != c and c in o]
-        votes[max(longer, key=len) if longer else c] += 1
-    ranked = votes.most_common()
-    if not ranked or (len(ranked) > 1 and ranked[0][1] == ranked[1][1]):
+    if not cands:
         return None
-    return ranked[0][0]
+    clusters = cluster_names(cands)
+    if len(clusters) > 1 and len(clusters[0]) == len(clusters[1]):
+        return None
+    return best_spelling(clusters[0])
 
 
 def find_last_name(doc, text, path, pages, known, batch_names=None, info=None):
     if doc == "HDA":      # no printed 'Name of patient' field: signature area + batch names
         try:
-            hit, readings = name_hda(path, pages, batch_names or set())
+            hit, readings, guess = name_hda(path, pages, batch_names or set())
         except Exception:
-            hit, readings = None, []
+            hit, readings, guess = None, [], None
         print(f"\n    HDA name readings: {readings} -> {hit}")      # so a wrong name can be traced
         if info is not None:
-            info["readings"] = readings
+            info["readings"], info["guess"] = readings, guess
         return hit or name_from_known(text, known)
     attempts = [
         lambda: name_labeled(doc, text),
@@ -623,7 +681,10 @@ def find_last_name(doc, text, path, pages, known, batch_names=None, info=None):
         name = re.sub(r"[^A-ZÑ'\- ]", "", (name or "").upper()).strip()
         if len(name) >= 3 and name not in NOT_NAMES:
             cands.append(name)
-    return choose(cands)
+    result = choose(cands)
+    if not result and cands and info is not None:
+        info["guess"] = best_spelling(cluster_names(cands)[0])     # pre-filled in Review
+    return result
 
 
 # ------------------------------------------------------------------- output
@@ -706,6 +767,83 @@ def flag_hda_conflicts(segs):
         after = [o for o in others if o["pages"][0] > last and o.get("name")]
         if before and after and before[-1]["name"] == after[0]["name"] != s["name"]:
             s["conflict"] = before[-1]["name"]
+
+
+# ------------------------------------------- one patient = one run of papers
+DOC_RANK = {"CF2": 0, "SOA": 1, "CSF": 2, "HDA": 3, "LAB": 4}   # the order they are scanned in
+
+
+def group_segments(segs):
+    """Pages of ONE patient are scanned together: CF2, SOA, CSF, HDA, then the lab reports.
+    A new patient starts when a document comes that should have been earlier in that order
+    (a second CF2, or an SOA after an HDA ...). Lab reports never start a patient.
+    Sets s['group'] (0, 1, 2 ...) on every document."""
+    g, top = -1, 99
+    for s in segs:
+        rank = DOC_RANK.get(s["doc"], 9)
+        if g < 0 or (s["doc"] != "LAB" and rank <= top):
+            g, top = g + 1, -1
+        top = max(top, rank)
+        s["group"] = g
+    return g + 1
+
+
+def group_consensus(members):
+    """The name most of a patient's CLEARLY read documents agree on (HDAs do not count: their
+    name is the hard one). None when there is no clear winner."""
+    names = [m["name"] for m in members if m.get("name") and m["doc"] != "HDA"]
+    if not names:
+        return None
+    clusters = cluster_names(names)
+    if len(clusters) > 1 and len(clusters[0]) == len(clusters[1]):
+        return None
+    return best_spelling(clusters[0])
+
+
+def resolve_group_identities(segs):
+    """Use the order of the papers to fix what OCR could not read on its own.
+      - a document whose name is a slip of the group's name takes the group's spelling,
+      - an HDA / LAB / other document with NO readable name takes the name of its patient's
+        other documents (HDAs: only if what was read from the signature does not contradict it),
+      - an HDA whose name clearly differs from its patient's other documents goes to Review.
+    Dates: a document with no date takes the date its patient's other documents share."""
+    n = group_segments(segs)
+    all_names = [m["name"] for m in segs if m.get("name") and m["doc"] != "HDA"]
+    for g in range(n):
+        members = [m for m in segs if m["group"] == g]
+        cons = group_consensus(members)
+        if cons:
+            for m in members:
+                nm = m.get("name")
+                if nm and nm != cons and m["doc"] != "HDA" and similar(nm, cons) >= 0.75:
+                    m["name"], m["name_note"] = cons, f"name {nm} corrected to {cons}"
+            for m in members:
+                if m["doc"] == "HDA":
+                    nxt = segs[segs.index(m) + 1] if segs.index(m) + 1 < len(segs) else None
+                    if nxt is not None and nxt["doc"] == "HDA":
+                        continue               # HDAs scanned in a row: the order says nothing
+                    nm = m.get("name")
+                    if not nm:
+                        others = {x for x in all_names if similar(x, cons) < 0.6}
+                        against = [r for r, c in Counter(m.get("readings") or []).items()
+                                   if c >= 2 and len(r) >= 4 and similar(r, cons) < 0.5
+                                   and any(similar(r, o) >= 0.8 for o in others)]
+                        if against:
+                            m["name"], m["conflict"] = against[0], cons
+                        elif USE_POSITION:
+                            m["name"], m["name_note"] = cons, "name taken from this patient's other documents"
+                    elif similar(nm, cons) >= 0.75:
+                        m["name"] = cons
+                    elif USE_POSITION:
+                        m["conflict"] = cons
+                elif not m.get("name") and USE_POSITION:
+                    m["name"], m["name_note"] = cons, "name taken from this patient's other documents"
+        dates = {m["date"] for m in members if m.get("date")}
+        if len(dates) == 1:
+            only = next(iter(dates))
+            for m in members:
+                if not m.get("date"):
+                    m["date"], m["date_note"] = only, "date taken from this patient's other documents"
 
 
 def span(pages):
@@ -1014,7 +1152,7 @@ def _write_review_queue(rows):
 def queue_review_items(path, plan):
     """Remember why each page group went to Review (review_queue.csv, opens in Excel)."""
     rows = [{"file": it["dest"].name, "source": path.name, "pages": span(it["pages"]), "doc": it["doc"],
-             "reason": it.get("reason", ""), "name_guess": it.get("name") or "",
+             "reason": it.get("reason", ""), "name_guess": it.get("name") or it.get("guess") or "",
              "date_guess": it.get("date") or "", "added": f"{datetime.now():%Y-%m-%d %H:%M}",
              "status": "open", "filed_as": ""} for it in plan if it["kind"] == "review"]
     if not rows:
@@ -1293,6 +1431,7 @@ def _process(path, dry):
                 batch_names.add(s["name"])
     print()
     emit("progress", key="identify", done=len(order), total=len(order))
+    resolve_group_identities(segs)
     fill_missing_dates(segs)
     flag_same_surname(segs)
     emit("stage", key="identify", status="done", detail=f"{len(order)} documents read")
@@ -1325,7 +1464,7 @@ def _process(path, dry):
         if len(pages) > MAX_PAGES_PER_DOC[doc] and not s.get("combined"):
             reasons.append(f"{len(pages)} pages is longer than a {doc} should be")
         if s.get("conflict"):
-            reasons.append(f"read as {s['name']} but the documents on both sides are {s['conflict']}")
+            reasons.append(f"read as {s['name']} but this patient's other documents say {s['conflict']}")
         if s.get("same_surname"):
             reasons.append(f"two different patients named {s['name']} on this date "
                            f"(first names {s['same_surname']}) - pages cannot be told apart")
@@ -1334,12 +1473,14 @@ def _process(path, dry):
         if not s["date"]:
             reasons.append("date not found")
         item = {"doc": doc, "pages": pages, "name": s["name"], "date": s["date"],
-                "readings": s.get("readings")}
+                "readings": s.get("readings"), "guess": s.get("guess")}
         if reasons:
             item.update(kind="review", result="REVIEW", reason="; ".join(reasons),
                         dest=unique_path(REVIEW, f"{path.stem}_{span(pages)}_{doc}__{reason_slug(reasons)}", taken))
         else:
             notes = []
+            if s.get("name_note"):
+                notes.append(s["name_note"])
             if s.get("date_note"):
                 notes.append(s["date_note"])
             if s.get("combined", 1) > 1:
