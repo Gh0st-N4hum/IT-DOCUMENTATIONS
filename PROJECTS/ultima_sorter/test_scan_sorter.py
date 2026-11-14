@@ -46,7 +46,7 @@ class Base(unittest.TestCase):
         ss.apply_settings({"inbox": str(r / "Inbox"), "sorted": str(r / "Sorted"), "review": str(r / "Review"),
                            "processed": str(r / "Processed"), "log_file": str(r / "log.txt"),
                            "manifest_dir": str(r / "Manifests"), "report_file": str(r / "report.csv"),
-                           "cache_dir": str(r / "Cache")})
+                           "cache_dir": str(r / "Cache"), "learn_file": str(r / "learned.json"), "use_learning": 1})
         for f in (ss.INBOX, ss.SORTED, ss.REVIEW, ss.PROCESSED):
             f.mkdir(parents=True, exist_ok=True)
 
@@ -272,6 +272,172 @@ class GroupTests(unittest.TestCase):
         self.assertEqual(ss.choose(["RRUEJO", "ARRUEJO"]), "ARRUEJO")
 
 
+class DateTests(Base):
+    def test_single_digit_days(self):
+        self.assertEqual(ss.valid_dates("Admitted: 11/5/2026 7:00 AM"), ["11-05-2026"])
+        self.assertEqual(ss.valid_dates("Date (Month/Day/Year) 11 / 6 / 2026"), ["11-06-2026"])
+        self.assertEqual(ss.valid_dates("3/6 monthly premium, 1/2/20269"), [])
+        self.assertEqual(ss.find_date("SOA", "Date and Time Admitted: 11/5/2026 7:00:00 AM"), "11-05-2026")
+        self.assertEqual(ss.find_date("HDA", "Date (Month/Day/Year) 11/5/2026\n29"), "11-05-2026")
+
+    def test_impossible_dates_are_ignored(self):
+        self.assertEqual(ss.valid_dates("13/45/2026 02/30/2026 10/19/1999"), [])
+
+    def test_boxed_dates_fill_only_missing_dates(self):
+        real = ss.boxed_dates
+        try:
+            ss.boxed_dates = lambda img: ["11-05-2026", "11-05-2026"]
+            src = make_pdf(self.tmp / "b.pdf", pages=3)
+            segs = [seg("CF2", "QUIBA", None, pages=(0,)), seg("CSF", "QUIBA", "11-04-2026", pages=(1,)),
+                    seg("CSF", "QUIBA", None, pages=(2,))]
+            ss.fill_boxed_dates(src, segs)
+            self.assertEqual([s["date"] for s in segs], ["11-05-2026", "11-04-2026", "11-05-2026"])
+            ss.boxed_dates = lambda img: ["11-05-2026", "11-06-2026"]
+            segs = [seg("CF2", "QUIBA", None, pages=(0,))]
+            ss.fill_boxed_dates(src, segs)
+            self.assertIsNone(segs[0]["date"])          # admitted and discharged disagree: no guess
+        finally:
+            ss.boxed_dates = real
+
+    def test_batch_whose_dates_are_only_in_boxes(self):
+        texts = [f"CLAIM FORM 2 patient confinement information\n1. Name of Patient: QUIBA PEDRO FENOL",
+                 "STATEMENT OF ACCOUNT itemized charges\nPatient Name: QUIBA, PEDRO FENOL Date and Time Admitted:",
+                 "CLAIM SIGNATURE FORM member and patient information\nName of Patient:\nQUIBA",
+                 "PHILHEALTH HEMODIALYSIS BENEFITS PACKAGE AGREEMENT FORM annex a"]
+        src = make_pdf(ss.INBOX / "batch.pdf", pages=4)
+        reader = PdfReader(str(src))
+        real, real_b, real_h = ss.read_all_pages, ss.boxed_dates, ss.name_hda_readings
+        ss.read_all_pages = lambda p: (reader, list(texts))
+        ss.boxed_dates = lambda img: ["11-05-2026", "11-05-2026"]
+        ss.name_hda_readings = lambda path, pages: []
+        try:
+            ok = ss.process(src, False)
+        finally:
+            ss.read_all_pages, ss.boxed_dates, ss.name_hda_readings = real, real_b, real_h
+        self.assertTrue(ok)
+        got = sorted(f.name for f in (ss.SORTED / "11-05-2026" / "QUIBA").glob("*.pdf"))
+        self.assertEqual(got, ["CF2.pdf", "CSF.pdf", "HDA.pdf", "SOA.pdf"])
+        self.assertEqual(list(ss.REVIEW.glob("*.pdf")), [])
+
+
+class LearningTests(Base):
+    def trust(self, *names):
+        for n in names:
+            ss.learn_correction("x.pdf", "SOA", "", n, "11-05-2026")
+
+    def test_a_name_becomes_trusted_after_three_clean_batches(self):
+        for _ in range(2):
+            ss.learn_batch({"QUIBA"})
+        self.assertEqual(ss.trusted_names(), set())
+        ss.learn_batch({"QUIBA"})
+        self.assertEqual(ss.trusted_names(), {"QUIBA"})
+
+    def test_a_name_you_confirm_is_trusted_at_once(self):
+        self.trust("ARRUEJO")
+        self.assertEqual(ss.trusted_names(), {"ARRUEJO"})
+
+    def test_snap_rules(self):
+        t = {"ARRUEJO", "QUIBA"}
+        self.assertEqual(ss.snap_to_trusted("ARRGEJO", t), "ARRUEJO")
+        self.assertIsNone(ss.snap_to_trusted("ARRUEJO", t))                      # already a known name
+        self.assertIsNone(ss.snap_to_trusted("MENDOZA", t))                      # not close to anything
+        self.assertIsNone(ss.snap_to_trusted("ARRGEJO", t, avoid={"ARRUEJO"}))   # that patient is another one in this batch
+        self.assertIsNone(ss.snap_to_trusted("CRUZ", {"CRUZE"}))                 # too short to guess
+        self.assertIsNone(ss.snap_to_trusted("SANTOSA", {"SANTOSO", "SANTOSE"})) # two equally close: do not pick
+
+    def test_batch_name_read_by_one_document_is_corrected(self):
+        self.trust("LLANES")
+        segs = [seg("CF2", "LLANEZ"), seg("HDA")]
+        ss.apply_learned_names(segs, {"LLANEZ": 1})
+        self.assertEqual(segs[0]["name"], "LLANES")
+        self.assertIn("matched", segs[0]["name_note"])
+
+    def test_name_read_cleanly_twice_is_never_changed(self):
+        self.trust("LLANES")
+        segs = [seg("CF2", "LLANEZ"), seg("SOA", "LLANEZ")]
+        ss.apply_learned_names(segs, {"LLANEZ": 2})
+        self.assertEqual(segs[0]["name"], "LLANEZ")
+
+    def test_other_patient_of_the_batch_is_never_merged(self):
+        self.trust("LLANES")
+        segs = [seg("CF2", "LLANES"), seg("CF2", "LLANEZ")]
+        ss.apply_learned_names(segs, {"LLANES": 1, "LLANEZ": 1})
+        self.assertEqual(segs[1]["name"], "LLANEZ")
+
+    def test_letter_mixups_are_counted_and_used(self):
+        for _ in range(3):
+            ss.learn_correction("x.pdf", "HDA", "ARRGEJO", "ARRUEJO", "11-05-2026")
+        data = ss.load_learned()
+        self.assertEqual(data["swaps"]["G>U"], 3)
+        cmap = ss._confusable_map(data["swaps"])
+        self.assertGreater(ss.learned_similar("ARRGEJO", "ARRUEJO", cmap), 0.99)
+        self.assertLess(ss.learned_similar("ARRGEJO", "ARRUEJO"), 0.99)
+
+    def test_switch_off(self):
+        ss.USE_LEARNING = 0
+        try:
+            ss.learn_batch({"QUIBA"})
+            self.trust("QUIBA")
+            self.assertEqual(ss.trusted_names(), set())
+            self.assertFalse(ss.LEARN_FILE.exists())
+        finally:
+            ss.USE_LEARNING = 1
+
+    def test_filing_in_review_teaches_and_logs(self):
+        make_pdf(ss.REVIEW / "r_HDA__no-name.pdf")
+        ss.file_review_item("r_HDA__no-name.pdf", "HDA", "quiba", "11-05-2026")
+        self.assertEqual(ss.trusted_names(), {"QUIBA"})
+        text = ss.corrections_path().read_text(encoding="utf-8-sig")
+        self.assertIn("QUIBA", text)
+        self.assertIn("11-05-2026", text)
+
+    def test_forget(self):
+        self.trust("QUIBA", "ARRUEJO")
+        ss.forget_learned("quiba")
+        self.assertEqual(ss.trusted_names(), {"ARRUEJO"})
+        ss.forget_learned(None)
+        self.assertEqual(ss.trusted_names(), set())
+
+    def test_broken_file_is_ignored(self):
+        ss.LEARN_FILE.write_text("{ nope", encoding="utf-8")
+        self.assertEqual(ss.trusted_names(), set())
+        ss.learn_batch({"QUIBA"})                              # and it recovers
+        self.assertIn("QUIBA", ss.load_learned()["names"])
+
+    def test_a_saved_batch_is_learned_and_a_test_run_is_not(self):
+        texts = ProcessFlow.patient_pages(self, "LLANES", "MARITE")
+        flow = ProcessFlow()
+        flow.tmp = self.tmp
+        real = ss.name_hda_readings
+        ss.name_hda_readings = lambda path, pages: []
+        try:
+            for dry in (True, False):
+                src = make_pdf(ss.INBOX / "batch.pdf", pages=len(texts))
+                reader = PdfReader(str(src))
+                real_r = ss.read_all_pages
+                ss.read_all_pages = lambda p: (reader, list(texts))
+                try:
+                    self.assertTrue(ss.process(src, dry))
+                finally:
+                    ss.read_all_pages = real_r
+                self.assertEqual("LLANES" in ss.load_learned()["names"], not dry)
+        finally:
+            ss.name_hda_readings = real
+
+    def test_single_misread_document_is_corrected_in_a_real_batch(self):
+        self.trust("LLANES")
+        texts = ["CLAIM FORM 2 patient confinement information\n1. Name of Patient: LLANEZ MARITE X\n10/19/2026 10/19/2026"]
+        src = make_pdf(ss.INBOX / "batch.pdf", pages=1)
+        reader = PdfReader(str(src))
+        real = ss.read_all_pages
+        ss.read_all_pages = lambda p: (reader, list(texts))
+        try:
+            ss.process(src, False)
+        finally:
+            ss.read_all_pages = real
+        self.assertTrue((ss.SORTED / "10-19-2026" / "LLANES" / "CF2.pdf").exists())
+
+
 class SettingsAndHousekeeping(Base):
     def test_apply_and_save(self):
         self.assertEqual(ss.apply_settings({"workers": "4", "log_max_mb": 5}), [])
@@ -424,6 +590,16 @@ class ServerTests(Base):
         self.assertEqual(self.call("GET", f"/api/state?t={self.server.token}", token=False)[0], 200)
         self.assertEqual(self.call("GET", "/api/nothing")[0], 404)
 
+    def test_assets(self):
+        st, body = self.call("GET", "/assets/startup.mp3", token=False)
+        self.assertEqual(st, 200)
+        self.assertGreater(len(body), 1000)
+        self.assertEqual(self.call("GET", "/assets/notify.mp3", token=False)[0], 200)
+        self.assertEqual(self.call("GET", "/assets/wallpaper.jpg", token=False)[0], 200)
+        self.assertEqual(self.call("GET", "/assets/../scan_sorter.py", token=False)[0], 404)
+        self.assertEqual(self.call("GET", "/assets/startup.mp3", token=False, host="evil.example.com")[0], 403)
+        self.assertEqual(self.call("GET", "/api/state", token=False)[0], 403)       # the API still needs the token
+
     def test_page_is_served(self):
         st, body = self.call("GET", "/")
         self.assertEqual(st, 200)
@@ -524,6 +700,16 @@ class ServerTests(Base):
         make_pdf(ss.SORTED / "10-19-2026" / "X" / "SOA.pdf")
         st, d = self.call("POST", "/api/addfiles", {"paths": [str(ss.SORTED / "10-19-2026" / "X" / "SOA.pdf")]})
         self.assertEqual(d["results"][0]["status"], "error")
+
+    def test_learned_api(self):
+        make_pdf(ss.REVIEW / "r_HDA.pdf")
+        self.call("POST", "/api/review/file", {"file": "r_HDA.pdf", "doc": "HDA", "name": "Quiba", "date": "11-05-2026"})
+        st, d = self.call("GET", "/api/learned")
+        self.assertEqual((st, [n["name"] for n in d["names"]]), (200, ["QUIBA"]))
+        self.assertTrue(d["names"][0]["trusted"])
+        self.assertEqual(self.call("POST", "/api/learned/forget", {})[0], 400)
+        st, d = self.call("POST", "/api/learned/forget", {"name": "QUIBA"})
+        self.assertEqual(d["names"], [])
 
     def test_settings_api(self):
         st, d = self.call("GET", "/api/settings")

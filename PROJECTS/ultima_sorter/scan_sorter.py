@@ -49,7 +49,7 @@ from pathlib import Path, PurePath
 os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 import pytesseract
 from pdf2image import convert_from_path
-from PIL import ImageOps
+from PIL import Image, ImageOps
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import NameObject
 from pytesseract import Output
@@ -71,6 +71,9 @@ KEEP_DEBUG_DAYS = 7                         # debug_*.txt files and the cache ar
 KEEP_CACHE_DAYS = 7
 LOG_MAX_MB = 2                              # the log is archived (sorter_log.1.txt) above this size
 OCR_DPI = 300
+LEARN_FILE = Path(r"C:\Scans\learned_names.json")   # surnames the program has learned (stays on this PC)
+USE_LEARNING = 1                            # 1 = remember confirmed names and match garbled readings to them
+USE_BOXED = 1                               # 1 = read the dates written in boxes on the CF2 and CSF
 USE_POSITION = 1                            # 1 = use the order of the papers (CF2, SOA, CSF, HDA, LAB) to name a document whose own name cannot be read
 SETTINGS_FILE = Path(__file__).resolve().with_name("settings.json")   # optional, overrides the above
 
@@ -171,7 +174,7 @@ SETTING_KEYS = {   # settings.json key -> (variable in this file, kind)
     "manifest_dir": ("MANIFEST_DIR", "path"), "report_file": ("REPORT_FILE", "path"),
     "cache_dir": ("CACHE_DIR", "path"),
     "workers": ("WORKERS", (1, 16)), "keep_debug_days": ("KEEP_DEBUG_DAYS", (0, 3650)),
-    "keep_cache_days": ("KEEP_CACHE_DAYS", (0, 3650)), "use_position": ("USE_POSITION", (0, 1)), "log_max_mb": ("LOG_MAX_MB", (1, 1000)),
+    "keep_cache_days": ("KEEP_CACHE_DAYS", (0, 3650)), "use_position": ("USE_POSITION", (0, 1)), "use_learning": ("USE_LEARNING", (0, 1)), "learn_file": ("LEARN_FILE", "path"), "use_boxed": ("USE_BOXED", (0, 1)), "log_max_mb": ("LOG_MAX_MB", (1, 1000)),
 }
 
 
@@ -392,12 +395,134 @@ def split_batch(texts):
 
 
 # --------------------------------------------------------------------- date
-PLAIN_DATE = re.compile(r"(?<![\d/\-])(\d{2})[-/](\d{2})[-/](\d{4})(?![\d/\-])")
+PLAIN_DATE = re.compile(r"(?<![\d/\-])(\d{1,2})\s?[-/]\s?(\d{1,2})\s?[-/]\s?(\d{4})(?![\d/\-])")   # 11/5/2026 as well as 11/05/2026
 LABEL_DATES = {   # a date printed right after a label (counts extra)
     "SOA": r"(?i:date and time admitted)[\s:|\"'.\-]*",
     "HDA": r"(?i:date \(month/day/year\))[\s:|\"'.\-]*",
     "LAB": r"\b(?i:date)\b[\s:|\"'.\-]*",
 }
+
+
+# ------------------------------------------------ dates written in boxes (CF2 / CSF)
+# On these forms the date is one digit per little box. OCR cannot read that as text, so each
+# digit is cut out of its box and read on its own, then the 8 digits are read as one line.
+def _components(bw, w, h):
+    """Connected blobs of ink in a black/white image (list of (x0,y0,x1,y1)). Pure Python."""
+    seen = bytearray(w * h)
+    boxes = []
+    for start in range(w * h):
+        if not bw[start] or seen[start]:
+            continue
+        stack, x0, y0, x1, y1 = [start], w, h, 0, 0
+        seen[start] = 1
+        while stack:
+            p = stack.pop()
+            y, x = divmod(p, w)
+            x0, x1, y0, y1 = min(x0, x), max(x1, x), min(y0, y), max(y1, y)
+            for dy in (-1, 0, 1):
+                ny = y + dy
+                if 0 <= ny < h:
+                    for dx in (-1, 0, 1):
+                        nx = x + dx
+                        if 0 <= nx < w:
+                            q = ny * w + nx
+                            if bw[q] and not seen[q]:
+                                seen[q] = 1
+                                stack.append(q)
+        boxes.append((x0, y0, x1, y1))
+    return boxes
+
+def digit_boxes(crop):
+    W, H = crop.size
+    bw = bytearray(1 if p < 135 else 0 for p in crop.getdata())
+    cand = [b for b in _components(bw, W, H)
+            if b[3] - b[1] >= 12 and b[2] - b[0] >= 4 and b[0] > 1 and b[2] < W - 2 and (b[2] - b[0]) <= (b[3] - b[1]) * 0.95]
+    best = []
+    for a in cand:
+        ah, ac = a[3] - a[1], (a[3] + a[1]) / 2
+        grp = [b for b in cand if abs((b[3] - b[1]) - ah) <= 0.15 * ah and abs((b[3] + b[1]) / 2 - ac) <= 0.2 * ah]
+        if len(grp) > len(best) or (len(grp) == len(best) and grp and ah > best[0][3] - best[0][1]):
+            best = grp
+    return sorted(best)
+
+def read_strip(gray, boxes):
+    """All digits pasted side by side on a clean strip and read as one line, 3 ways; the
+    reading that most variants agree on (and has one character per digit) wins."""
+    tiles = []
+    for (x0, y0, x1, y1) in boxes:
+        g = gray.crop((x0 - 3, y0 - 3, x1 + 4, y1 + 4))
+        tiles.append(g.resize((max(1, int(g.width * 64 / g.height)), 64)))
+    strip = Image.new("L", (sum(t.width for t in tiles) + 50 * len(tiles) + 40, 120), 255)
+    x = 30
+    for t in tiles:
+        strip.paste(t, (x, 28))
+        x += t.width + 50
+    votes = Counter()
+    for thr in (None, 110, 150, 180):
+        im = strip if thr is None else strip.point(lambda p: 255 if p > thr else 0)
+        for psm in (7, 13):
+            t = re.sub(r"\D", "", pytesseract.image_to_string(im, config=f"--psm {psm} -c tessedit_char_whitelist=0123456789"))
+            if len(t) == len(boxes):
+                votes[t] += 1
+    if not votes:
+        return None
+    (best, n), = votes.most_common(1)
+    return best if n >= 3 else None
+
+
+def boxed_dates(img):
+    """Dates found in the boxed 'Date Admitted' / 'Date Discharged' fields of a CF2 or CSF
+    page image -> list of 'MM-DD-YYYY' (only complete, valid dates 2020-2035)."""
+    W, H = img.size
+    top = ImageOps.autocontrast(img.crop((0, 0, W, int(H * 0.6))).convert("L"))
+    words = []
+    for psm in (6, 4, 11):                      # the label is not always found with the first layout mode
+        d = pytesseract.image_to_data(top, config=f"--psm {psm}", output_type=Output.DICT)
+        words = [(d["text"][k], d["left"][k], d["top"][k], d["width"][k], d["height"][k])
+                 for k in range(len(d["text"])) if d["text"][k].strip()]
+        if any(re.match(r"(?i)(admitted|discharg\w*)\W*$", w[0]) for w in words):
+            break
+    found = []
+    for k, w in enumerate(words):
+        if not re.match(r"(?i)(admitted|discharg\w*)\W*$", w[0]):
+            continue
+        lab = words[k - 1] if k and words[k - 1][0].lower().startswith("date") else w
+        h = max(10, min(lab[4], 40))
+        yc = lab[2] + lab[4] // 2
+        x0 = w[1] + w[3] + 4
+        nxt = [v[1] for v in words if v[1] > x0 + 12 * h and abs(v[2] + v[4] // 2 - yc) < h and re.match(r"(?i)(b\.|c\.|d\.|time)", v[0])]
+        x1 = min(nxt + [x0 + int(26 * h)])
+        crop = ImageOps.autocontrast(top.crop((x0, max(0, yc - int(h * 1.6)), min(W, x1), yc + int(h * 1.6))))
+        boxes = digit_boxes(crop)
+        if len(boxes) != 8:
+            continue
+        text = read_strip(crop, boxes)
+        if text:
+            mo, dd, yy = int(text[:2]), int(text[2:4]), int(text[4:])
+            try:
+                datetime(yy, mo, dd)
+            except ValueError:
+                continue
+            if 2020 <= yy <= 2035:
+                found.append(f"{mo:02d}-{dd:02d}-{yy}")
+    return found
+
+
+def fill_boxed_dates(path, segs):
+    """For CF2 / CSF documents that still have no date: read the boxed date fields of their first page.
+    Admitted and discharged normally say the same day; if they disagree nothing is guessed."""
+    for s in segs:
+        if s["doc"] not in ("CF2", "CSF") or s.get("date") or not USE_BOXED:
+            continue
+        check_cancel()
+        try:
+            dates = boxed_dates(render(path, s["pages"][0]))
+        except Exception:
+            continue
+        if dates and len(set(dates)) == 1:
+            s["date"], s["date_note"] = dates[0], "date read from the boxes"
+        elif dates:
+            s["date_conflict"] = dates
 
 
 def valid_dates(text):
@@ -420,7 +545,7 @@ def find_date(doc, text):
     votes = Counter(valid_dates(text))
     pat = LABEL_DATES.get(doc)
     if pat:
-        m = re.search(pat + r"(\d{2}[-/]\d{2}[-/]\d{4})", text)
+        m = re.search(pat + r"(\d{1,2}\s?[-/]\s?\d{1,2}\s?[-/]\s?\d{4})", text)
         if m:
             for d in valid_dates(m.group(1)):
                 votes[d] += 2
@@ -573,6 +698,185 @@ def _hda_hires(path, i, cap):
     return out
 
 
+# --------------------------------------------- learning from what you confirm
+# Nothing here is machine learning: it is a list of surnames with counters, plus a count of which
+# letters OCR mixes up on YOUR scans (U read as G ...). It lives in learned_names.json next to the
+# other data, can be viewed and cleared in the window, and never leaves this computer.
+LEARN_AUTO_TRUST = 3        # a name sorted without trouble in this many batches is trusted
+_LEARN_LOCK = threading.RLock()
+
+
+def corrections_path():
+    return LEARN_FILE.with_name("corrections.csv")
+
+
+def load_learned():
+    """{'names': {NAME: {'auto': n, 'confirmed': n, 'last': 'YYYY-MM-DD'}}, 'swaps': {'U>G': n}} (never raises)."""
+    try:
+        data = json.loads(LEARN_FILE.read_text(encoding="utf-8-sig"))
+        if isinstance(data, dict):
+            data.setdefault("names", {})
+            data.setdefault("swaps", {})
+            if isinstance(data["names"], dict) and isinstance(data["swaps"], dict):
+                return data
+    except (OSError, ValueError):
+        pass
+    return {"names": {}, "swaps": {}}
+
+
+def save_learned(data):
+    LEARN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = LEARN_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, LEARN_FILE)
+
+
+def trusted_from(data):
+    return {n for n, v in data["names"].items()
+            if len(n) >= 3 and (v.get("confirmed", 0) >= 1 or v.get("auto", 0) >= LEARN_AUTO_TRUST)}
+
+
+def trusted_names():
+    if not USE_LEARNING:
+        return set()
+    with _LEARN_LOCK:
+        return trusted_from(load_learned())
+
+
+def _confusable_map(swaps):
+    """Letters OCR often mixes up on these scans (3+ times) are treated as the same letter when comparing."""
+    parent = {}
+
+    def find(x):
+        while parent.setdefault(x, x) != x:
+            x = parent[x]
+        return x
+    for key, n in swaps.items():
+        if n >= 3 and re.fullmatch(r"[A-Z0-9]>[A-Z0-9]", key):
+            a, b = find(key[0]), find(key[2])
+            if a != b:
+                parent[max(a, b)] = min(a, b)
+    return {c: find(c) for c in list(parent)}
+
+
+def learned_similar(a, b, cmap=None):
+    plain = SequenceMatcher(None, a, b).ratio()
+    if not cmap:
+        return plain
+    fa, fb = "".join(cmap.get(c, c) for c in a), "".join(cmap.get(c, c) for c in b)
+    return max(plain, SequenceMatcher(None, fa, fb).ratio())
+
+
+def snap_to_trusted(name, trusted, avoid=(), min_ratio=0.82, margin=0.08, cmap=None):
+    """The ONE trusted name that a garbled reading clearly is (or None).
+    Never for a name that is itself trusted, or when the match is another patient of this batch."""
+    if not name or len(name) < 5 or name in trusted:      # short surnames (CRUZ, ARCE) are too easy to confuse
+        return None
+    ranked = sorted(((learned_similar(name, t, cmap), t) for t in trusted if t not in avoid), reverse=True)
+    if not ranked or ranked[0][0] < min_ratio or (len(ranked) > 1 and ranked[0][0] - ranked[1][0] < margin):
+        return None
+    return ranked[0][1]
+
+
+def apply_learned_names(segs, raw_counts):
+    """Replace a name that was read by a SINGLE document (or only from an HDA signature) and is not
+    known, with the trusted name it clearly is. A name read cleanly by 2+ documents is left alone:
+    that is a real patient, even if a known surname looks similar."""
+    if not USE_LEARNING:
+        return
+    with _LEARN_LOCK:
+        data = load_learned()
+    trusted = trusted_from(data)
+    if not trusted:
+        return
+    cmap = _confusable_map(data["swaps"])
+    batch = {s["name"] for s in segs if s.get("name")}
+    for name in sorted(batch - trusted):
+        if raw_counts.get(name, 0) >= 2:
+            continue
+        hit = snap_to_trusted(name, trusted, avoid=batch - {name}, cmap=cmap)
+        if hit:
+            for s in segs:
+                if s.get("name") == name:
+                    s["name"], s["name_note"] = hit, f"name {name} matched to the known patient {hit}"
+
+
+def learned_guess(guess):
+    """A looser match, only used to pre-fill the Review box."""
+    if not guess or not USE_LEARNING:
+        return guess
+    with _LEARN_LOCK:
+        data = load_learned()
+    return snap_to_trusted(guess, trusted_from(data), min_ratio=0.72, margin=0.05,
+                           cmap=_confusable_map(data["swaps"])) or guess
+
+
+def learn_batch(names):
+    """A batch was saved without trouble: count each patient name once."""
+    if not USE_LEARNING:
+        return
+    try:
+        with _LEARN_LOCK:
+            data = load_learned()
+            today = f"{datetime.now():%Y-%m-%d}"
+            for n in {n for n in names if n and len(n) >= 3}:
+                v = data["names"].setdefault(n, {})
+                v["auto"], v["last"] = v.get("auto", 0) + 1, today
+            save_learned(data)
+    except OSError as e:
+        log(f"  ! could not update learned_names.json ({e})")
+
+
+def learn_correction(file, doc, read_name, typed_name, typed_date):
+    """You filed a Review item: the name you typed is confirmed, the letters OCR got wrong are counted,
+    and the case is added to corrections.csv (real examples to test the program with)."""
+    if not USE_LEARNING:
+        return
+    try:
+        with _LEARN_LOCK:
+            data = load_learned()
+            v = data["names"].setdefault(typed_name, {})
+            v["confirmed"], v["last"] = v.get("confirmed", 0) + 1, f"{datetime.now():%Y-%m-%d}"
+            if read_name and read_name != typed_name and SequenceMatcher(None, read_name, typed_name).ratio() >= 0.6:
+                for tag, i1, i2, j1, j2 in SequenceMatcher(None, read_name, typed_name).get_opcodes():
+                    if tag == "replace" and i2 - i1 == j2 - j1:
+                        for a, b in zip(read_name[i1:i2], typed_name[j1:j2]):
+                            key = f"{a}>{b}"
+                            data["swaps"][key] = data["swaps"].get(key, 0) + 1
+            save_learned(data)
+        path = corrections_path()
+        new = not path.exists()
+        with open(path, "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["when", "doc", "program_read", "you_typed", "date_you_typed", "file"])
+            w.writerow([f"{datetime.now():%Y-%m-%d %H:%M}", doc, read_name or "", typed_name, typed_date, file])
+    except OSError as e:
+        log(f"  ! could not save what was learned ({e})")
+
+
+def learned_summary():
+    with _LEARN_LOCK:
+        data = load_learned()
+    trusted = trusted_from(data)
+    names = [{"name": n, "auto": v.get("auto", 0), "confirmed": v.get("confirmed", 0),
+              "last": v.get("last", ""), "trusted": n in trusted} for n, v in data["names"].items()]
+    names.sort(key=lambda x: (not x["trusted"], x["name"]))
+    swaps = sorted(((k, n) for k, n in data["swaps"].items()), key=lambda kv: -kv[1])[:20]
+    return {"names": names, "swaps": [{"pair": k, "count": n} for k, n in swaps], "file": str(LEARN_FILE)}
+
+
+def forget_learned(name=None):
+    """Forget one name, or everything (names and letter mix-ups)."""
+    with _LEARN_LOCK:
+        data = load_learned()
+        if name is None:
+            data = {"names": {}, "swaps": {}}
+        else:
+            data["names"].pop(clean_name(name), None)
+        save_learned(data)
+
+
 def snap_to_batch(readings, batch_names, min_ratio=0.75, margin=0.1, min_votes=2):
     """Match garbled readings ('ARRBEVO') to a name that was read CLEANLY from another
     document of this same batch (CF2/SOA/CSF have printed 'Name of patient' fields).
@@ -657,7 +961,7 @@ def choose(cands):
 def find_last_name(doc, text, path, pages, known, batch_names=None, info=None):
     if doc == "HDA":      # no printed 'Name of patient' field: signature area + batch names
         try:
-            hit, readings, guess = name_hda(path, pages, batch_names or set())
+            hit, readings, guess = name_hda(path, pages, (batch_names or set()) | trusted_names())
         except Exception:
             hit, readings, guess = None, [], None
         print(f"\n    HDA name readings: {readings} -> {hit}")      # so a wrong name can be traced
@@ -1152,7 +1456,7 @@ def _write_review_queue(rows):
 def queue_review_items(path, plan):
     """Remember why each page group went to Review (review_queue.csv, opens in Excel)."""
     rows = [{"file": it["dest"].name, "source": path.name, "pages": span(it["pages"]), "doc": it["doc"],
-             "reason": it.get("reason", ""), "name_guess": it.get("name") or it.get("guess") or "",
+             "reason": it.get("reason", ""), "name_guess": it.get("name") or learned_guess(it.get("guess")) or "",
              "date_guess": it.get("date") or "", "added": f"{datetime.now():%Y-%m-%d %H:%M}",
              "status": "open", "filed_as": ""} for it in plan if it["kind"] == "review"]
     if not rows:
@@ -1257,6 +1561,8 @@ def file_review_item(file, doc, name, date):
     if doc not in DOC_TYPES:
         raise ValueError("Choose the document type.")
     name, date = clean_name(name), clean_date(date)
+    row = next((r for r in read_review_queue() if r.get("file") == src.name), {})
+    read_name = row.get("name_guess") or ""
     reader = PdfReader(str(src))
     pages = len(reader.pages)
     _, found = pdfa_markers(reader)
@@ -1276,6 +1582,7 @@ def file_review_item(file, doc, name, date):
         raise RuntimeError(f"{dest.name} {err}")
     rel = str(dest.relative_to(SORTED))
     _mark_review(src.name, "filed", rel)
+    learn_correction(src.name, doc, read_name, name, date)
     log(f"  Review: {src.name} filed as {rel}" + ("  [added to the existing LAB.pdf]" if merged else ""))
     return {"dest": rel, "merged": merged, "pdfa_ok": ok, "pdfa": detail}
 
@@ -1417,6 +1724,7 @@ def _process(path, dry):
     # names read cleanly from the other documents of this batch.
     order = [s for s in segs if s["doc"] != "HDA"] + [s for s in segs if s["doc"] == "HDA"]
     batch_names = set()
+    raw_counts = Counter()
     for k, s in enumerate(order, 1):
         text = "\n".join(texts[i] for i in s["pages"])
         print(f"\r  identifying document {k}/{len(order)}", end="", flush=True)
@@ -1429,9 +1737,14 @@ def _process(path, dry):
             known.add(s["name"])
             if s["doc"] != "HDA":
                 batch_names.add(s["name"])
+                raw_counts[s["name"]] += 1
     print()
     emit("progress", key="identify", done=len(order), total=len(order))
     resolve_group_identities(segs)
+    emit("progress", key="identify", done=len(order), total=len(order), detail="reading the date boxes")
+    fill_boxed_dates(path, segs)
+    resolve_group_identities(segs)
+    apply_learned_names(segs, raw_counts)
     fill_missing_dates(segs)
     flag_same_surname(segs)
     emit("stage", key="identify", status="done", detail=f"{len(order)} documents read")
@@ -1618,6 +1931,7 @@ def _process(path, dry):
         emit("stage", key="finish", status="failed", detail="the original could not be moved out of the Inbox")
         return False
     drop_ocr_cache(path)
+    learn_batch({it["name"] for it in plan if it["kind"] == "sorted"})
     emit("stage", key="finish", status="done", detail="original moved to Processed")
     return True
 

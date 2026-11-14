@@ -46,6 +46,8 @@ STAGES = [
     ("finish", "Completeness and tidy up"),
 ]
 MAX_UPLOAD = 4 * 1024 * 1024 * 1024      # 4 GB
+ASSETS = Path(__file__).resolve().parent / "assets"      # wallpaper.jpg, startup.mp3, notify.mp3
+ASSET_TYPES = {"wallpaper.jpg": "image/jpeg", "startup.mp3": "audio/mpeg", "notify.mp3": "audio/mpeg"}
 
 
 def fresh_stages():
@@ -332,13 +334,14 @@ class Handler(BaseHTTPRequestHandler):
         return self.server.runner
 
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
+        extra = dict(extra or {})
         if not isinstance(body, (bytes, bytearray)):
             body = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        for k, v in (extra or {}).items():
+        self.send_header("Cache-Control", extra.pop("Cache-Control", "no-store"))
+        for k, v in extra.items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
@@ -346,7 +349,7 @@ class Handler(BaseHTTPRequestHandler):
     def _fail(self, code, message):
         self._send(code, {"error": message})
 
-    def _guard(self, query):
+    def _guard(self, query, need_token=True):
         """Only this computer's own page may use the API: right Host, right Origin, right token."""
         port = self.server.server_address[1]
         allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
@@ -358,7 +361,7 @@ class Handler(BaseHTTPRequestHandler):
             self._fail(403, "Request from another site was refused.")
             return False
         token = self.headers.get("X-Token") or (query.get("t") or [""])[0]
-        if not secrets.compare_digest(token, self.server.token):
+        if need_token and not secrets.compare_digest(token, self.server.token):
             self._fail(403, "This page was opened from an old address. Open Scan Sorter again.")
             return False
         return True
@@ -373,13 +376,21 @@ class Handler(BaseHTTPRequestHandler):
     def _dispatch(self, method):
         url = urlparse(self.path)
         query = parse_qs(url.query)
-        if not self._guard(query):
+        route = url.path
+        if not self._guard(query, need_token=not route.startswith("/assets/")):
             self.close_connection = True
             return
-        route = url.path
         try:
             if method == "GET" and route == "/":
                 self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                return
+            if method == "GET" and route.startswith("/assets/"):
+                name = route[len("/assets/"):]
+                f = ASSETS / name
+                if name not in ASSET_TYPES or not f.is_file():
+                    self._fail(404, "Not found.")
+                    return
+                self._send(200, f.read_bytes(), ASSET_TYPES[name], {"Cache-Control": "max-age=86400"})
                 return
             if not route.startswith("/api/"):
                 self._fail(404, "Not found.")
@@ -579,6 +590,20 @@ class Handler(BaseHTTPRequestHandler):
         self.server.opener(target)
         self._send(200, {"ok": True})
 
+    # ---- what the program has learned
+    def api_get_learned(self, q):
+        self._send(200, ss.learned_summary())
+
+    def api_post_learned_forget(self, q):
+        b = self._json_body()
+        if b.get("all"):
+            ss.forget_learned(None)
+        elif b.get("name"):
+            ss.forget_learned(b["name"])
+        else:
+            raise ValueError("Say which name to forget.")
+        self._send(200, ss.learned_summary())
+
     # ---- completeness and settings
     def api_get_completeness(self, q):
         self.runner.refresh_attention()
@@ -634,7 +659,8 @@ def open_app_window(url):
                 exe = Path(root) / sub
                 if exe.exists():
                     try:
-                        subprocess.Popen([str(exe), f"--app={url}", "--window-size=1280,860"])
+                        subprocess.Popen([str(exe), f"--app={url}", "--window-size=1280,860",
+                                          "--autoplay-policy=no-user-gesture-required"])
                         return
                     except OSError:
                         pass
@@ -682,140 +708,159 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Scan Sorter</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230e6b66'/%3E%3Cpath d='M9 8h10l4 4v12H9z' fill='none' stroke='white' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232a62bd'/%3E%3Cpath d='M9 8h10l4 4v12H9z' fill='none' stroke='white' stroke-width='2'/%3E%3C/svg%3E">
 <style>
 :root{
-  --bg:#e8edeb; --surface:#f7f9f8; --raised:#ffffff; --ink:#10262b; --muted:#566b6f; --line:#c9d5d2;
-  --accent:#0e6b66; --accent-ink:#ffffff; --accent-soft:#d5e9e6;
-  --ok:#1b7a4c; --ok-soft:#d6eedf; --warn:#9a5f00; --warn-soft:#f6e6c4; --bad:#b3261e; --bad-soft:#f6d9d6;
-  --info:#2a5a9c; --info-soft:#d9e5f5; --idle-soft:#e1e8e6;
-  --head:Bahnschrift,"Segoe UI Variable Display","Segoe UI",system-ui,sans-serif;
-  --body:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,sans-serif;
-  --mono:"Cascadia Mono",Consolas,"SFMono-Regular",monospace;
-}
-@media (prefers-color-scheme:dark){
-  :root:not([data-theme="light"]){
-    --bg:#0e181b; --surface:#152226; --raised:#1a2a2f; --ink:#e2ecea; --muted:#92a8ab; --line:#2a3d42;
-    --accent:#4fc1b6; --accent-ink:#06201e; --accent-soft:#17383a;
-    --ok:#62d093; --ok-soft:#163626; --warn:#e5b04c; --warn-soft:#3a2d12; --bad:#ff8a80; --bad-soft:#401d1a;
-    --info:#8db8f2; --info-soft:#172e4a; --idle-soft:#1e2e33;
-  }
+  --bg:#a9c4e4; --surface:#f4f7fc; --raised:#ffffff; --ink:#14233a; --muted:#4d5f78; --line:#8ea6c6;
+  --accent:#1f5fbf; --accent-ink:#ffffff; --accent-soft:#d3e3f8;
+  --ok:#17692f; --ok-soft:#d6f0d9; --warn:#8a5200; --warn-soft:#fbeab8; --bad:#a3190f; --bad-soft:#fbd6d1;
+  --info:#1b4f9c; --info-soft:#d7e5fa; --idle-soft:#e4e9f1;
+  --glass:linear-gradient(#ffffff80,#ffffff10 50%,#00000008 51%,#ffffff30);
+  --head:"Trebuchet MS","Lucida Grande",Tahoma,Verdana,sans-serif;
+  --body:Tahoma,"Lucida Grande",Verdana,"Segoe UI",sans-serif;
+  --mono:"Lucida Console","Courier New",Consolas,monospace;
 }
 *{box-sizing:border-box}
-html{color-scheme:light dark}
-body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 var(--body)}
+html{color-scheme:light}
+body{margin:0;color:var(--ink);font:13.5px/1.45 var(--body);
+  background:#3a6ea5 url(/assets/wallpaper.jpg) center/cover no-repeat fixed}
 button,input,select{font:inherit;color:inherit}
-:focus-visible{outline:3px solid var(--accent);outline-offset:2px;border-radius:4px}
-h1,h2,h3{font-family:var(--head);font-weight:600;margin:0;letter-spacing:.01em}
-h2{font-size:1.05rem}
-.shell{max-width:1240px;margin:0 auto;padding:0 16px 40px}
-header.top{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:18px 0 10px}
-header.top h1{font-size:1.5rem;letter-spacing:.02em}
-.pill{display:inline-flex;align-items:center;gap:8px;padding:4px 12px;border-radius:999px;background:var(--idle-soft);font-size:.9rem;max-width:100%}
-.pill .dot{width:9px;height:9px;border-radius:50%;background:var(--muted);flex:none}
-.pill.working{background:var(--accent-soft)} .pill.working .dot{background:var(--accent);animation:pulse 1.2s ease-in-out infinite}
-.pill.off{background:var(--bad-soft)} .pill.off .dot{background:var(--bad)}
-@keyframes pulse{50%{opacity:.25}}
+:focus-visible{outline:2px dotted #000;outline-offset:2px;box-shadow:0 0 0 3px #ffffffcc}
+h1,h2,h3{font-family:var(--head);font-weight:700;margin:0}
+.shell{max-width:1240px;margin:14px auto;padding:0 0 22px;background:linear-gradient(#e9f0fa,#d6e2f3);border:1px solid #4a6d9c;border-radius:10px;
+  box-shadow:0 0 0 1px #ffffffaa inset,0 10px 30px #1a3a6a66,0 2px 0 #fff inset;overflow:hidden}
+.shell>*{margin-left:16px;margin-right:16px}
+header.top{margin:0!important;padding:8px 14px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  background:linear-gradient(#5e93e0 0%,#2f6bd1 48%,#1f56b3 52%,#2c68c9 100%);border-bottom:1px solid #123a80;color:#fff;
+  box-shadow:inset 0 1px 0 #ffffffaa}
+header.top h1{font-size:1.25rem;color:#fff;text-shadow:0 1px 2px #0a2a66;letter-spacing:.02em;padding-left:30px;
+  background:radial-gradient(circle at 35% 30%,#fff 0 12%,#9fd0ff 13% 40%,#2a6fd6 41% 100%) no-repeat 2px 50%/22px 22px}
 .spacer{flex:1}
-nav.tabs{display:flex;gap:4px;border-bottom:2px solid var(--line);margin-bottom:18px;overflow-x:auto}
-nav.tabs button{background:none;border:0;padding:10px 16px;cursor:pointer;font-family:var(--head);font-size:1rem;color:var(--muted);border-bottom:3px solid transparent;margin-bottom:-2px;white-space:nowrap}
-nav.tabs button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--accent)}
-nav.tabs .badge{display:inline-block;min-width:1.4em;padding:0 6px;margin-left:6px;border-radius:999px;background:var(--warn);color:#fff;font-size:.8rem;text-align:center}
-.panel[hidden],.badge[hidden]{display:none}
-.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
-.card>h2{margin-bottom:10px;display:flex;align-items:center;gap:10px}
-.card>h2 small{font-family:var(--body);font-weight:400;color:var(--muted);font-size:.85rem}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:3px 12px;border-radius:999px;background:linear-gradient(#cfd8c0,#e8efd9);color:#1c2a12;
+  border:1px solid #6b7a55;box-shadow:inset 0 2px 3px #00000040,0 1px 0 #ffffff99;font-family:var(--mono);font-size:.85rem;max-width:100%}
+.pill .dot{width:11px;height:11px;border-radius:50%;flex:none;background:radial-gradient(circle at 35% 30%,#fff 0 15%,#9aa 16% 100%);box-shadow:0 0 0 1px #0004}
+.pill.working .dot{background:radial-gradient(circle at 35% 30%,#fff 0 15%,#5ee27a 16% 55%,#139a35 100%);animation:pulse 1.2s ease-in-out infinite}
+.pill.off{background:linear-gradient(#e9c3bd,#f7ded9)} .pill.off .dot{background:radial-gradient(circle at 35% 30%,#fff 0 15%,#ff7a6e 16% 55%,#b4271b 100%)}
+@keyframes pulse{50%{opacity:.35}}
+nav.tabs{display:flex;gap:3px;margin:14px 16px 0!important;padding:0 6px;overflow-x:auto;border-bottom:1px solid #4a6d9c}
+nav.tabs button{background:linear-gradient(#f9fbff,#c9d8ee);border:1px solid #6d89b4;border-bottom:0;border-radius:7px 7px 0 0;padding:6px 18px;cursor:pointer;
+  font-family:var(--head);font-size:.95rem;color:#243b5e;white-space:nowrap;margin-top:4px;box-shadow:inset 0 1px 0 #fff}
+nav.tabs button:hover{background:linear-gradient(#fff,#dbe7f8)}
+nav.tabs button[aria-selected=true]{background:linear-gradient(#ffffff,#f1f6fd);margin-top:0;padding-top:9px;margin-bottom:-1px;color:#000;font-weight:700}
+nav.tabs .badge{display:inline-block;min-width:1.5em;padding:0 6px;margin-left:6px;border-radius:999px;color:#fff;font-size:.75rem;text-align:center;
+  background:radial-gradient(circle at 40% 25%,#ff9a8f,#d02a1c 60%,#8f150b);border:1px solid #6a0f07;text-shadow:0 1px 1px #0008}
+.panel[hidden],.badge[hidden],nav.tabs .badge[hidden]{display:none}
+.scroll:has(table[hidden]){display:none}
+.panel{margin-top:16px!important}
+.card{background:var(--surface);border:1px solid #5f7ca8;border-radius:8px;margin-bottom:16px;overflow:hidden;
+  box-shadow:0 2px 5px #1a3a6a40,inset 0 1px 0 #fff;padding:0 0 14px}
+.card>*{margin-left:14px;margin-right:14px}
+.card>h2{margin:0!important;padding:5px 12px;font-size:.95rem;color:#fff;text-shadow:0 1px 1px #082a66;display:flex;align-items:center;gap:10px;margin-bottom:12px!important;
+  background:linear-gradient(#6fa3ea,#3a77d6 48%,#2a62bd 52%,#3a76cf);border-bottom:1px solid #1b4a96;box-shadow:inset 0 1px 0 #ffffff99}
+.card>h2 small{font-family:var(--body);font-weight:400;color:#e5efff;font-size:.8rem;text-shadow:none}
 .grid{display:grid;grid-template-columns:minmax(0,5fr) minmax(0,7fr);gap:16px;align-items:start}
 @media (max-width:960px){.grid{grid-template-columns:minmax(0,1fr)}}
-.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:8px;border:1px solid var(--line);background:var(--raised);cursor:pointer}
-.btn:hover:not(:disabled){border-color:var(--accent)}
-.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
-.btn.danger{border-color:var(--bad);color:var(--bad)}
-.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:5px 16px;border-radius:999px;cursor:pointer;font-family:var(--body);color:#10203a;
+  border:1px solid #5d7192;background:linear-gradient(#ffffff 0%,#e6ecf5 48%,#c5d0e2 52%,#e0e8f4 100%);
+  box-shadow:inset 0 1px 0 #fff,0 1px 2px #0003;text-shadow:0 1px 0 #ffffffb0}
+.btn:hover:not(:disabled){background:linear-gradient(#ffffff 0%,#eef3fb 48%,#d3dff0 52%,#eaf1fa 100%);border-color:#2f5fb0}
+.btn:active:not(:disabled){background:linear-gradient(#c0cde2,#dfe8f5);box-shadow:inset 0 2px 4px #0004}
+.btn.primary{color:#fff;font-weight:700;text-shadow:0 1px 1px #07295e;border-color:#133f86;
+  background:linear-gradient(#7fb2f5 0%,#3b83e6 48%,#1f65c9 52%,#4c93ee 100%)}
+.btn.primary:hover:not(:disabled){background:linear-gradient(#97c3fa 0%,#4d93f0 48%,#2b74da 52%,#63a3f4 100%)}
+.btn.primary:active:not(:disabled){background:linear-gradient(#1b58b0,#3f86e0)}
+.btn.danger{color:#8a1209;border-color:#8f2c22;background:linear-gradient(#fff 0%,#fbe1de 48%,#f0b9b2 52%,#f8d6d1 100%)}
+.btn:disabled{opacity:.5;cursor:not-allowed;filter:grayscale(.5)}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .muted{color:var(--muted)} .small{font-size:.88rem}
-/* drop zone */
-#drop{border:2px dashed var(--accent);border-radius:12px;padding:30px 20px;text-align:center;background:var(--raised);transition:background .15s,border-color .15s}
-#drop.over{background:var(--accent-soft);border-style:solid}
-#drop .big{font-family:var(--head);font-size:1.35rem;margin-bottom:4px}
-#drop .row{justify-content:center;margin-top:14px}
-.toggles{display:flex;gap:20px;flex-wrap:wrap;margin-top:14px}
+#drop{border:2px dashed #4b74b3;border-radius:8px;padding:26px 18px;text-align:center;
+  background:linear-gradient(#ffffff,#e9f1fc);box-shadow:inset 0 3px 8px #1a3a6a33;transition:background .15s}
+#drop.over{background:linear-gradient(#fff8d0,#ffe99a);border-color:#b07a00}
+#drop .big{font-family:var(--head);font-size:1.3rem;margin-bottom:4px;text-shadow:0 1px 0 #fff;color:#1b3f7a}
+#drop .row{justify-content:center;margin-top:12px}
+.toggles{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px}
 .toggles label{display:flex;gap:8px;align-items:center;cursor:pointer}
-input[type=checkbox],input[type=radio]{width:18px;height:18px;accent-color:var(--accent)}
-/* pipeline stepper */
+input[type=checkbox],input[type=radio]{width:16px;height:16px;accent-color:#2a62bd}
 ol.steps{list-style:none;margin:0;padding:0}
-ol.steps li{position:relative;display:grid;grid-template-columns:28px 1fr;gap:12px;padding:0 0 18px}
+ol.steps li{position:relative;display:grid;grid-template-columns:30px 1fr;gap:10px;padding:0 0 16px}
 ol.steps li:last-child{padding-bottom:0}
-ol.steps li::before{content:"";position:absolute;left:13px;top:28px;bottom:0;width:2px;background:var(--line)}
+ol.steps li::before{content:"";position:absolute;left:13px;top:28px;bottom:0;width:4px;border-radius:2px;background:linear-gradient(90deg,#9fb4d3,#d3dff0);box-shadow:inset 0 0 0 1px #7c93b8}
 ol.steps li:last-child::before{display:none}
-ol.steps li.done::before{background:var(--ok)}
-.mark{width:28px;height:28px;border-radius:50%;border:2px solid var(--line);background:var(--raised);display:grid;place-items:center;font-size:.85rem;font-weight:700;z-index:1}
-li.running .mark{border-color:var(--accent);box-shadow:0 0 0 4px var(--accent-soft)}
-li.running .mark::after{content:"";width:10px;height:10px;border-radius:50%;background:var(--accent);animation:pulse 1.1s ease-in-out infinite}
-li.done .mark{background:var(--ok);border-color:var(--ok);color:#fff}
-li.failed .mark{background:var(--bad);border-color:var(--bad);color:#fff}
-li.skipped .mark{border-style:dashed;color:var(--muted)}
-ol.steps .lbl{font-weight:600;line-height:28px}
+ol.steps li.done::before{background:linear-gradient(90deg,#2f9e49,#7fd68f)}
+.mark{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;font-size:.9rem;font-weight:700;z-index:1;color:#56688a;
+  background:radial-gradient(circle at 35% 25%,#fff 0 18%,#dbe4f1 19% 70%,#aab9d0 100%);border:1px solid #6d82a6;box-shadow:0 1px 2px #0004}
+li.running .mark{background:radial-gradient(circle at 35% 25%,#fff 0 15%,#ffe27a 16% 60%,#e0a100 100%);border-color:#8a6200;box-shadow:0 0 8px #ffbf0099}
+li.running .mark::after{content:"";width:8px;height:8px;border-radius:50%;background:#8a5200;animation:pulse 1s ease-in-out infinite}
+li.done .mark{color:#fff;text-shadow:0 1px 1px #064;background:radial-gradient(circle at 35% 25%,#d9ffe0 0 12%,#4fd36d 13% 55%,#13852f 100%);border-color:#0d5a1f}
+li.failed .mark{color:#fff;background:radial-gradient(circle at 35% 25%,#ffd9d4 0 12%,#f1584a 13% 55%,#a3190f 100%);border-color:#6a0f07}
+li.skipped .mark{opacity:.6}
+ol.steps .lbl{font-weight:700;line-height:28px;color:#10203a}
 li.waiting .lbl{color:var(--muted);font-weight:400}
-ol.steps .detail{color:var(--muted);font-size:.9rem;margin-top:-2px;overflow-wrap:anywhere}
+ol.steps .detail{color:var(--muted);font-size:.88rem;margin-top:-2px;overflow-wrap:anywhere}
 li.failed .detail{color:var(--bad)}
-.bar{height:8px;border-radius:99px;background:var(--idle-soft);margin-top:6px;overflow:hidden}
-.bar>i{display:block;height:100%;background:var(--accent);transition:width .25s}
-.nowtitle{font-family:var(--head);font-size:1.15rem;overflow-wrap:anywhere}
-/* chips */
-.chip{display:inline-block;padding:1px 9px;border-radius:999px;font-size:.82rem;font-weight:600;background:var(--idle-soft);white-space:nowrap}
-.chip.ok,.chip.done,.chip.sorted{background:var(--ok-soft);color:var(--ok)}
-.chip.warn,.chip.attention,.chip.review{background:var(--warn-soft);color:var(--warn)}
-.chip.bad,.chip.failed{background:var(--bad-soft);color:var(--bad)}
-.chip.info,.chip.processing,.chip.tested{background:var(--info-soft);color:var(--info)}
-.chip.ignored,.chip.waiting,.chip.stopped{background:var(--idle-soft);color:var(--muted)}
-.chip.doc{font-family:var(--mono);background:var(--raised);border:1px solid var(--line);font-weight:500}
-/* tables / lists */
-.scroll{overflow:auto;max-height:420px}
+.bar{height:14px;border-radius:7px;margin-top:6px;overflow:hidden;background:linear-gradient(#b9c6da,#e7edf6);border:1px solid #5f7ca8;box-shadow:inset 0 2px 3px #0003}
+.bar>i{display:block;height:100%;border-radius:6px;transition:width .25s;
+  background:linear-gradient(#aef0a8 0%,#5ed15a 45%,#2fa638 50%,#63d56b 100%);box-shadow:inset 0 1px 0 #ffffffb0}
+.nowtitle{font-family:var(--head);font-size:1.1rem;overflow-wrap:anywhere;color:#10203a}
+.chip{display:inline-block;padding:0 9px;border-radius:999px;font-size:.78rem;font-weight:700;white-space:nowrap;border:1px solid #7a8ca8;
+  background:linear-gradient(#fff,#dfe6f1);color:#3a4a63;box-shadow:inset 0 1px 0 #fff}
+.chip.ok,.chip.done,.chip.sorted{background:linear-gradient(#e6fbe8,#b6e6bb);border-color:#3f8f4c;color:var(--ok)}
+.chip.warn,.chip.attention,.chip.review{background:linear-gradient(#fff6d2,#f7dd8a);border-color:#a8801c;color:var(--warn)}
+.chip.bad,.chip.failed{background:linear-gradient(#ffe6e2,#f4b3ab);border-color:#a8453a;color:var(--bad)}
+.chip.info,.chip.processing,.chip.tested{background:linear-gradient(#e7f0ff,#b8d0f5);border-color:#4a72b4;color:var(--info)}
+.chip.ignored,.chip.waiting,.chip.stopped{color:var(--muted)}
+.chip.doc{font-family:var(--mono);font-weight:700;background:linear-gradient(#fff,#e6ebf3)}
+.scroll{overflow:auto;max-height:420px;margin:0 14px;border:1px solid #6d89b4;border-radius:4px;background:#fff;box-shadow:inset 0 2px 5px #1a3a6a30}
+.scroll table{margin:0}
 table{border-collapse:collapse;width:100%}
-th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top;font-size:.92rem}
-th{font-family:var(--head);font-weight:600;color:var(--muted);font-size:.85rem;position:sticky;top:0;background:var(--surface)}
-td.mono,.mono{font-family:var(--mono);font-size:.85rem}
-td.nw{white-space:nowrap}
-td .why{display:block;color:var(--muted);font-size:.85rem}
-.empty{color:var(--muted);padding:10px 0}
+th,td{text-align:left;padding:5px 9px;border-bottom:1px solid #d3dcea;vertical-align:top;font-size:.9rem}
+th{font-family:var(--head);font-weight:700;color:#10203a;font-size:.84rem;position:sticky;top:0;background:linear-gradient(#fdfeff,#d4deee);border-bottom:1px solid #6d89b4}
+tbody tr:nth-child(even){background:#f1f6fd}
+td.mono,.mono{font-family:var(--mono);font-size:.82rem} td.nw{white-space:nowrap}
+td .why{display:block;color:var(--muted);font-size:.82rem}
+.empty{color:var(--muted);padding:8px 14px}
 ul.plain{list-style:none;margin:0;padding:0}
-ul.plain li{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--line)}
+ul.plain li{display:flex;gap:10px;align-items:baseline;padding:6px 0;border-bottom:1px solid #cfd9e8}
 ul.plain li:last-child{border-bottom:0}
 ul.plain .nm{flex:1;overflow-wrap:anywhere}
-pre#log{margin:0;background:var(--raised);border:1px solid var(--line);border-radius:8px;padding:10px;height:260px;overflow:auto;font:12.5px/1.45 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
-/* review */
+.card>ol.steps,.card>ul.plain,.card #attnBody ul.plain{margin-left:14px;margin-right:14px}
+#attnBody ul.plain{margin:0}
+#attnBody,#queue{padding:0}
+pre#log{margin:0 14px;background:#06140a;color:#6dff8c;border:2px solid #44566f;border-radius:4px;padding:8px 10px;height:260px;overflow:auto;
+  font:12px/1.4 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;box-shadow:inset 0 3px 8px #000c;text-shadow:0 0 4px #29ff5f66}
 .rv{display:grid;grid-template-columns:minmax(260px,4fr) minmax(0,8fr);gap:16px}
 @media (max-width:960px){.rv{grid-template-columns:minmax(0,1fr)}}
-.rvlist button{display:block;width:100%;text-align:left;background:var(--raised);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:8px;cursor:pointer}
-.rvlist button[aria-current=true]{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
-.rvlist .f{font-size:.85rem;overflow-wrap:anywhere}
-.rvlist .reasons{margin-top:4px;color:var(--warn);font-size:.85rem}
-.preview{background:var(--raised);border:1px solid var(--line);border-radius:8px;min-height:260px;display:grid;place-items:center;overflow:auto;max-height:560px}
-.preview img{max-width:100%;height:auto;display:block}
-.form{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:14px 0}
-.field label{display:block;font-size:.88rem;color:var(--muted);margin-bottom:3px}
-input[type=text],select{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--raised)}
-.err{color:var(--bad);margin-top:8px;min-height:1.4em}
-/* move files */
+.rvlist button{display:block;width:100%;text-align:left;background:linear-gradient(#fff,#e9eff8);border:1px solid #6d89b4;border-radius:6px;padding:8px 12px;margin-bottom:8px;cursor:pointer;box-shadow:0 1px 2px #0003,inset 0 1px 0 #fff}
+.rvlist button[aria-current=true]{background:linear-gradient(#cfe1fb,#a9c8f3);border-color:#1f56b3;box-shadow:inset 0 2px 4px #0003}
+.rvlist .f{font-size:.82rem;overflow-wrap:anywhere}
+.rvlist .reasons{margin-top:3px;color:var(--warn);font-size:.82rem}
+.preview{background:#7d8aa0;border:2px inset #c9d3e3;border-radius:3px;min-height:260px;display:grid;place-items:center;overflow:auto;max-height:560px;margin:0 14px;box-shadow:inset 0 3px 8px #0006}
+.preview img{max-width:100%;height:auto;display:block;box-shadow:0 3px 10px #0007}
+.form{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:14px 14px}
+.field label{display:block;font-size:.84rem;color:var(--muted);margin-bottom:3px}
+input[type=text],select{width:100%;padding:5px 8px;border:1px solid #5f7ca8;border-radius:4px;background:#fff;box-shadow:inset 0 2px 4px #1a3a6a40}
+input[type=text]:focus,select:focus{border-color:#1f56b3;box-shadow:inset 0 2px 4px #1a3a6a40,0 0 0 3px #7fb2f580;outline:none}
+.err{color:var(--bad);margin:8px 14px 0;min-height:1.4em;font-weight:700}
 .mv{display:grid;grid-template-columns:minmax(0,6fr) minmax(0,5fr);gap:16px}
 @media (max-width:960px){.mv{grid-template-columns:minmax(0,1fr)}}
-.tree{max-height:520px;overflow:auto;border:1px solid var(--line);border-radius:8px;background:var(--raised);padding:8px 10px}
+.tree{max-height:520px;overflow:auto;border:1px solid #6d89b4;border-radius:4px;background:#fff;padding:8px 10px;box-shadow:inset 0 2px 5px #1a3a6a30}
 .tree details{margin-left:4px} .tree summary{cursor:pointer;padding:3px 0;display:flex;align-items:center;gap:8px}
 .tree .file{display:flex;align-items:center;gap:8px;padding:2px 0 2px 26px}
 .tree .file .grow{flex:1}
-.link{background:none;border:0;color:var(--accent);cursor:pointer;padding:0;text-decoration:underline}
+.link{background:none;border:0;color:#0b45b8;cursor:pointer;padding:0;text-decoration:underline}
 .dest{display:flex;gap:8px} .dest input{flex:1}
-.settings{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
-/* modal + toast */
-dialog{border:1px solid var(--line);border-radius:12px;background:var(--surface);color:var(--ink);padding:18px;width:min(560px,92vw)}
-dialog::backdrop{background:rgba(0,0,0,.45)}
-.dirs{border:1px solid var(--line);border-radius:8px;background:var(--raised);max-height:300px;overflow:auto;margin:10px 0}
-.dirs button{display:block;width:100%;text-align:left;background:none;border:0;border-bottom:1px solid var(--line);padding:8px 12px;cursor:pointer}
-.dirs button:hover{background:var(--accent-soft)}
+.settings{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin:0 14px}
+dialog{border:1px solid #1b4a96;border-radius:8px;background:linear-gradient(#f4f7fc,#dbe6f6);color:var(--ink);padding:0 0 14px;width:min(560px,92vw);box-shadow:0 10px 40px #0009;overflow:hidden}
+dialog>*{margin-left:14px;margin-right:14px}
+dialog>h2{margin:0!important;padding:5px 12px;font-size:.95rem;color:#fff;text-shadow:0 1px 1px #082a66;margin-bottom:8px!important;
+  background:linear-gradient(#6fa3ea,#3a77d6 48%,#2a62bd 52%,#3a76cf);border-bottom:1px solid #1b4a96}
+dialog::backdrop{background:rgba(20,40,80,.5)}
+.dirs{border:1px solid #6d89b4;border-radius:4px;background:#fff;max-height:300px;overflow:auto;margin:10px 14px;box-shadow:inset 0 2px 5px #1a3a6a30}
+.dirs button{display:block;width:100%;text-align:left;background:none;border:0;border-bottom:1px solid #dbe3ef;padding:6px 12px;cursor:pointer}
+.dirs button:hover{background:#cfe1fb}
 #toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:20;max-width:min(420px,90vw)}
-.toast{background:var(--ink);color:var(--bg);padding:10px 14px;border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,.25)}
-.toast.bad{background:var(--bad);color:#fff}
+.toast{background:linear-gradient(#fffbe2,#f6e9a6);color:#2a2410;padding:8px 14px;border-radius:6px;border:1px solid #8a7a2a;box-shadow:0 4px 14px #0006,inset 0 1px 0 #fff}
+.toast.bad{background:linear-gradient(#ffe6e2,#f4b3ab);border-color:#8f2c22;color:#5a0c05}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 </head>
@@ -825,6 +870,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
     <h1>Scan Sorter</h1>
     <span id="status" class="pill"><span class="dot"></span><span id="statusText">Connecting…</span></span>
     <span class="spacer"></span>
+    <button class="btn" id="btnSound" aria-pressed="true" title="Turn the startup and notification sounds on or off">Sound: on</button>
     <button class="btn" id="btnQuit" title="Stop Scan Sorter and close it">Quit Scan Sorter</button>
   </header>
   <nav class="tabs" role="tablist" aria-label="Sections">
@@ -974,6 +1020,14 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
       <div class="row" style="margin-top:14px"><button class="btn primary" id="btnSaveSet">Save settings</button></div>
       <div class="err" id="setErr" role="alert"></div>
     </div>
+    <div class="card">
+      <h2>Names the program has learned <small id="lrnNote"></small></h2>
+      <div class="muted small" style="margin-bottom:10px">Names you confirm in Review, and names sorted without trouble in 3 batches, are trusted: a garbled reading that clearly looks like one of them is corrected to it. A wrong name can be removed here. Stored only on this PC in <span class="mono" id="lrnFile"></span>.</div>
+      <div class="scroll" style="max-height:300px"><table id="lrnTable"><thead><tr><th>Name</th><th>Sorted</th><th>Confirmed by you</th><th>Last seen</th><th>Trusted</th><th></th></tr></thead><tbody></tbody></table></div>
+      <div class="empty" id="lrnEmpty">Nothing learned yet. It starts with your first sorted batch or your first filed Review item.</div>
+      <div class="muted small" id="lrnSwaps" style="margin-top:8px"></div>
+      <div class="row" style="margin-top:10px"><button class="btn danger" id="btnForgetAll">Forget everything it learned</button></div>
+    </div>
   </section>
 </div>
 
@@ -1013,7 +1067,24 @@ async function api(path, json) {
   if (!r.ok) throw new Error((data && data.error) || ('Something went wrong (' + r.status + ')'));
   return data;
 }
-function toast(msg, bad) {
+/* ---------- sounds ---------- */
+let soundOn = true;
+try { soundOn = localStorage.getItem('sound') !== 'off'; } catch (e) {}
+const sndStart = new Audio('/assets/startup.mp3'), sndNotify = new Audio('/assets/notify.mp3');
+function playSound(a) {
+  if (!soundOn) return Promise.resolve();
+  try { a.currentTime = 0; return a.play().catch(() => {}); } catch (e) { return Promise.resolve(); }
+}
+function drawSound() { const b = $('#btnSound'); b.textContent = 'Sound: ' + (soundOn ? 'on' : 'off'); b.setAttribute('aria-pressed', soundOn); }
+function startupSound() {
+  if (!soundOn) return;
+  sndStart.play().catch(() => {      /* the browser wants a click first: play on the first click or key */
+    const once = () => { removeEventListener('pointerdown', once); removeEventListener('keydown', once); playSound(sndStart); };
+    addEventListener('pointerdown', once); addEventListener('keydown', once);
+  });
+}
+function toast(msg, bad, sound) {
+  if (bad || sound) playSound(sndNotify);
   const t = document.createElement('div'); t.className = 'toast' + (bad ? ' bad' : ''); t.textContent = msg;
   $('#toasts').appendChild(t); setTimeout(() => t.remove(), bad ? 7000 : 4500);
 }
@@ -1103,7 +1174,7 @@ async function poll() {
   try {
     const s = await api('state?since=' + since);
     renderState(s);
-    if (lastBusy && !s.busy) { if ($('#p-review').hidden === false) loadReview(); if ($('#p-move').hidden === false) loadTree(); }
+    if (lastBusy && !s.busy) { playSound(sndNotify); if ($('#p-review').hidden === false) loadReview(); if ($('#p-move').hidden === false) loadTree(); }
     lastBusy = s.busy;
   } catch (e) {
     $('#status').className = 'pill off'; $('#statusText').textContent = 'Scan Sorter is not running - open it again';
@@ -1184,7 +1255,7 @@ $('#rvFile').addEventListener('click', async () => {
   const idx = rvItems.indexOf(rvSel);
   try {
     const r = await api('review/file', {file: rvSel.file, doc, name, date});
-    toast('Filed as ' + r.dest + (r.merged ? ' (added to the existing LAB.pdf)' : '') + (r.pdfa_ok ? '' : ' - ' + r.pdfa), !r.pdfa_ok);
+    toast('Filed as ' + r.dest + (r.merged ? ' (added to the existing LAB.pdf)' : '') + (r.pdfa_ok ? '' : ' - ' + r.pdfa), !r.pdfa_ok, true);
     await loadReview(rvItems[idx + 1] && rvItems[idx + 1].file);
   } catch (e) { $('#rvErr').textContent = e.message; }
 });
@@ -1250,7 +1321,7 @@ $('#btnGo').addEventListener('click', async () => {
     const c = {}; r.results.forEach(x => c[x.status] = (c[x.status] || 0) + 1);
     $('#xferResults').innerHTML = '<div><b>' + Object.entries(c).map(([k, v]) => v + ' ' + k).join(', ') + '</b></div><ul class="plain small">' +
       r.results.filter(x => x.status === 'skipped' || x.status === 'error').map(x => '<li><span class="chip ' + (x.status === 'error' ? 'bad' : 'warn') + '">' + esc(x.status) + '</span><span class="nm mono">' + esc(x.path) + ' - ' + esc(x.detail) + '</span></li>').join('') + '</ul>';
-    toast(Object.entries(c).map(([k, v]) => v + ' ' + k).join(', '), !!c.error);
+    toast(Object.entries(c).map(([k, v]) => v + ' ' + k).join(', '), !!c.error, true);
     if (move) loadTree(); else syncTree();
   } catch (e) { $('#xferResults').textContent = ''; toast(e.message, true); syncTree(); }
 });
@@ -1279,18 +1350,36 @@ $('#fsMk').addEventListener('click', async () => {
 /* ---------- settings tab ---------- */
 const SET_LABELS = {inbox: 'Inbox (scans arrive here)', sorted: 'Sorted', review: 'Review', processed: 'Processed (original batches)',
   log_file: 'Log file', manifest_dir: 'Batch records', report_file: 'Completeness report file', cache_dir: 'Temporary OCR cache',
-  workers: 'Pages read at the same time (1-16)', keep_debug_days: 'Keep debug files (days)', keep_cache_days: 'Keep OCR cache (days)', use_position: 'Name a document from its patient\'s other papers when its own name is unreadable (1 = yes, 0 = no)', log_max_mb: 'Archive the log above (MB)'};
+  workers: 'Pages read at the same time (1-16)', keep_debug_days: 'Keep debug files (days)', keep_cache_days: 'Keep OCR cache (days)', use_learning: 'Learn from my corrections (1 = yes, 0 = no)', learn_file: 'Learned names file', use_position: 'Name a document from its patient\'s other papers when its own name is unreadable (1 = yes, 0 = no)', log_max_mb: 'Archive the log above (MB)'};
+async function loadLearned() {
+  try {
+    const d = await api('learned'); $('#lrnFile').textContent = d.file;
+    $('#lrnTable tbody').innerHTML = d.names.map(n => '<tr><td><b>' + esc(n.name) + '</b></td><td>' + n.auto + '</td><td>' + n.confirmed + '</td><td class="mono nw">' + esc(n.last) + '</td><td>' + (n.trusted ? '<span class="chip ok">trusted</span>' : '<span class="chip waiting">not yet</span>') + '</td><td><button class="link" data-forget="' + esc(n.name) + '">remove</button></td></tr>').join('');
+    $('#lrnTable').parentElement.hidden = !d.names.length; $('#lrnEmpty').hidden = d.names.length > 0;
+    $('#lrnNote').textContent = d.names.filter(n => n.trusted).length + ' trusted of ' + d.names.length;
+    $('#lrnSwaps').textContent = d.swaps.length ? 'Letters it has seen OCR mix up: ' + d.swaps.map(x => x.pair.replace('>', ' read as ') .replace(/^(.) read as (.)$/, 'was $2, read as $1') + ' (' + x.count + ')').join(', ') : '';
+  } catch (e) { toast(e.message, true); }
+}
 async function loadSettings() {
+  loadLearned();
   try {
     const d = await api('settings'); $('#setFile').textContent = d.file;
     $('#setForm').innerHTML = Object.entries(SET_LABELS).map(([k, l]) =>
       '<div class="field"><label for="set_' + k + '">' + esc(l) + '</label><input type="text" id="set_' + k + '" data-k="' + k + '" value="' + esc(d.values[k]) + '"></div>').join('');
   } catch (e) { toast(e.message, true); }
 }
+$('#lrnTable').addEventListener('click', async e => {
+  const b = e.target.closest('[data-forget]'); if (!b) return;
+  try { await api('learned/forget', {name: b.dataset.forget}); loadLearned(); } catch (err) { toast(err.message, true); }
+});
+$('#btnForgetAll').addEventListener('click', async () => {
+  if (!confirm('Forget every learned name and letter mix-up? Your sorted files are not touched.')) return;
+  try { await api('learned/forget', {all: true}); loadLearned(); toast('Forgot everything it learned.'); } catch (err) { toast(err.message, true); }
+});
 $('#btnSaveSet').addEventListener('click', async () => {
   $('#setErr').textContent = '';
   const values = {}; $$('#setForm input').forEach(i => values[i.dataset.k] = i.value.trim());
-  try { await api('settings', {values}); toast('Settings saved.'); } catch (e) { $('#setErr').textContent = e.message; }
+  try { await api('settings', {values}); toast('Settings saved.', false, true); } catch (e) { $('#setErr').textContent = e.message; }
 });
 
 /* ---------- pick PDFs anywhere on this PC ---------- */
@@ -1321,6 +1410,11 @@ $('#pkGo').addEventListener('click', async () => {
   } catch (e) { $('#pkErr').textContent = e.message; pkSync(); }
 });
 
+$('#btnSound').addEventListener('click', () => {
+  soundOn = !soundOn; try { localStorage.setItem('sound', soundOn ? 'on' : 'off'); } catch (e) {}
+  drawSound(); if (soundOn) playSound(sndNotify);
+});
+drawSound(); startupSound();
 poll();
 </script>
 </body>
